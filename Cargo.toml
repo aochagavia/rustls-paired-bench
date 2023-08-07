@@ -1,0 +1,12 @@
+[package]
+name = "rustls-paired-bench"
+version = "0.1.0"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+fastrand = "2.0.0"
+rustls_baseline = { package = "rustls", version = "=0.21.0" }
+rustls_candidate = { package = "rustls", git = "https://github.com/rustls/rustls.git", rev="40e4b5d6428edcac2275b547edb70e028beb9f31" }
+rustls-pemfile = "1.0.3"
