@@ -1,6 +1,6 @@
 use std::sync::Arc;
-use std::time::Instant;
-use crate::shared::{BenchmarkParam, ResumptionParam};
+use std::time::{Duration, Instant};
+use crate::shared::{BenchmarkParam, ClientAuth, ResumptionParam};
 
 mod shared {
     #[derive(PartialEq, Clone, Copy)]
@@ -66,13 +66,14 @@ mod shared {
 }
 
 mod baseline {
-    use std::io::Read;
+    use std::io::{Read, Write};
     use std::ops::{Deref, DerefMut};
     use std::sync::Arc;
     use std::{fs, io};
     use rustls_baseline::{Certificate, ClientConfig, ClientConnection, ConnectionCommon, PrivateKey, RootCertStore, ServerConfig, ServerConnection, SideData, SupportedCipherSuite, SupportedProtocolVersion, Ticketer};
     use rustls_baseline::client::Resumption;
-    use rustls_baseline::server::{AllowAnyAuthenticatedClient, NoClientAuth, NoServerSessionStorage, ServerSessionMemoryCache};
+    use rustls_baseline::crypto::ring::Ring;
+    use rustls_baseline::server::{NoServerSessionStorage, ServerSessionMemoryCache, WebPkiClientVerifier};
     use crate::shared::{BenchmarkParam, ClientAuth, KeyType, ResumptionParam};
 
     fn get_chain(key_type: KeyType) -> Vec<Certificate> {
@@ -119,10 +120,10 @@ mod baseline {
         params: &BenchmarkParam<SupportedCipherSuite, SupportedProtocolVersion>,
         clientauth: ClientAuth,
         resume: ResumptionParam,
-    ) -> ClientConfig {
+    ) -> ClientConfig<Ring> {
         let mut root_store = RootCertStore::empty();
         let mut rootbuf =
-            std::io::BufReader::new(std::fs::File::open(params.key_type.path_for("ca.cert")).unwrap());
+            io::BufReader::new(fs::File::open(params.key_type.path_for("ca.cert")).unwrap());
         root_store.add_parsable_certificates(&rustls_pemfile::certs(&mut rootbuf).unwrap());
 
         let cfg = ClientConfig::builder()
@@ -157,7 +158,7 @@ mod baseline {
         client_auth: ClientAuth,
         resume: ResumptionParam,
         max_fragment_size: Option<usize>,
-    ) -> ServerConfig {
+    ) -> ServerConfig<Ring> {
         let client_auth = match client_auth {
             ClientAuth::Yes => {
                 let roots = get_chain(params.key_type);
@@ -165,9 +166,9 @@ mod baseline {
                 for root in roots {
                     client_auth_roots.add(&root).unwrap();
                 }
-                Arc::new(AllowAnyAuthenticatedClient::new(client_auth_roots))
+                WebPkiClientVerifier::builder(Arc::new(client_auth_roots)).build().unwrap()
             }
-            ClientAuth::No => NoClientAuth::boxed(),
+            ClientAuth::No => WebPkiClientVerifier::no_client_auth(),
         };
 
         let mut cfg = ServerConfig::builder()
@@ -191,15 +192,37 @@ mod baseline {
         cfg
     }
 
-    pub fn bench_handshake(client_config: Arc<ClientConfig>, server_config: Arc<ServerConfig>) {
+    pub fn bench_handshake(client_config: Arc<ClientConfig<Ring>>, server_config: Arc<ServerConfig<Ring>>) {
         let server_name = "localhost".try_into().unwrap();
         let mut client = ClientConnection::new(Arc::clone(&client_config), server_name).unwrap();
         let mut server = ServerConnection::new(Arc::clone(&server_config)).unwrap();
+        do_handshake(&mut client, &mut server);
+    }
 
-        transfer(&mut client, &mut server, None);
-        transfer(&mut server, &mut client, None);
-        transfer(&mut client, &mut server, None);
-        transfer(&mut server, &mut client, None);
+    pub fn handshaked_connections(client_config: Arc<ClientConfig<Ring>>, server_config: Arc<ServerConfig<Ring>>) -> (ClientConnection, ServerConnection) {
+        let server_name = "localhost".try_into().unwrap();
+        let mut client = ClientConnection::new(client_config, server_name).unwrap();
+        client.set_buffer_limit(None);
+        let mut server = ServerConnection::new(Arc::clone(&server_config)).unwrap();
+        server.set_buffer_limit(None);
+
+        do_handshake(&mut client, &mut server);
+        (client, server)
+    }
+
+    pub fn bench_transfer(client: &mut ClientConnection, server: &mut ServerConnection, buf: &[u8]) {
+        server.writer().write_all(buf).unwrap();
+        transfer(server, client, Some(buf.len()));
+    }
+
+    fn do_handshake(client: &mut ClientConnection, server: &mut ServerConnection) {
+        loop {
+            transfer(client, server, None);
+            transfer(server, client, None);
+            if !server.is_handshaking() && !client.is_handshaking() {
+                break;
+            }
+        }
     }
 
     fn transfer<L, R, LS, RS>(left: &mut L, right: &mut R, expect_data: Option<usize>)
@@ -247,7 +270,7 @@ mod baseline {
                     loop {
                         let sz = match right.reader().read(&mut data_buf) {
                             Ok(sz) => sz,
-                            Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => break,
+                            Err(err) if err.kind() == io::ErrorKind::WouldBlock => break,
                             Err(err) => panic!("failed to read data: {}", err),
                         };
 
@@ -268,12 +291,13 @@ mod baseline {
 
 mod candidate {
     use std::{fs, io};
-    use std::io::Read;
+    use std::io::{Read, Write};
     use std::ops::{Deref, DerefMut};
     use std::sync::Arc;
     use rustls_candidate::{Certificate, ClientConfig, ClientConnection, ConnectionCommon, PrivateKey, RootCertStore, ServerConfig, ServerConnection, SideData, SupportedCipherSuite, SupportedProtocolVersion, Ticketer};
     use rustls_candidate::client::Resumption;
-    use rustls_candidate::server::{AllowAnyAuthenticatedClient, NoClientAuth, NoServerSessionStorage, ServerSessionMemoryCache};
+    use rustls_candidate::crypto::ring::Ring;
+    use rustls_candidate::server::{NoServerSessionStorage, ServerSessionMemoryCache, WebPkiClientVerifier};
     use crate::shared::{BenchmarkParam, ClientAuth, KeyType, ResumptionParam};
 
     fn get_chain(key_type: KeyType) -> Vec<Certificate> {
@@ -320,10 +344,10 @@ mod candidate {
         params: &BenchmarkParam<SupportedCipherSuite, SupportedProtocolVersion>,
         clientauth: ClientAuth,
         resume: ResumptionParam,
-    ) -> ClientConfig {
+    ) -> ClientConfig<Ring> {
         let mut root_store = RootCertStore::empty();
         let mut rootbuf =
-            std::io::BufReader::new(std::fs::File::open(params.key_type.path_for("ca.cert")).unwrap());
+            io::BufReader::new(fs::File::open(params.key_type.path_for("ca.cert")).unwrap());
         root_store.add_parsable_certificates(&rustls_pemfile::certs(&mut rootbuf).unwrap());
 
         let cfg = ClientConfig::builder()
@@ -357,7 +381,7 @@ mod candidate {
         client_auth: ClientAuth,
         resume: ResumptionParam,
         max_fragment_size: Option<usize>,
-    ) -> ServerConfig {
+    ) -> ServerConfig<Ring> {
         let client_auth = match client_auth {
             ClientAuth::Yes => {
                 let roots = get_chain(params.key_type);
@@ -365,9 +389,9 @@ mod candidate {
                 for root in roots {
                     client_auth_roots.add(&root).unwrap();
                 }
-                Arc::new(AllowAnyAuthenticatedClient::new(client_auth_roots))
+                WebPkiClientVerifier::builder(Arc::new(client_auth_roots)).build().unwrap()
             }
-            ClientAuth::No => NoClientAuth::boxed(),
+            ClientAuth::No => WebPkiClientVerifier::no_client_auth(),
         };
 
         let mut cfg = ServerConfig::builder()
@@ -391,15 +415,37 @@ mod candidate {
         cfg
     }
 
-    pub fn bench_handshake(client_config: Arc<ClientConfig>, server_config: Arc<ServerConfig>) {
+    pub fn bench_handshake(client_config: Arc<ClientConfig<Ring>>, server_config: Arc<ServerConfig<Ring>>) {
         let server_name = "localhost".try_into().unwrap();
         let mut client = ClientConnection::new(Arc::clone(&client_config), server_name).unwrap();
         let mut server = ServerConnection::new(Arc::clone(&server_config)).unwrap();
+        do_handshake(&mut client, &mut server);
+    }
 
-        transfer(&mut client, &mut server, None);
-        transfer(&mut server, &mut client, None);
-        transfer(&mut client, &mut server, None);
-        transfer(&mut server, &mut client, None);
+    pub fn handshaked_connections(client_config: Arc<ClientConfig<Ring>>, server_config: Arc<ServerConfig<Ring>>) -> (ClientConnection, ServerConnection) {
+        let server_name = "localhost".try_into().unwrap();
+        let mut client = ClientConnection::new(client_config, server_name).unwrap();
+        client.set_buffer_limit(None);
+        let mut server = ServerConnection::new(Arc::clone(&server_config)).unwrap();
+        server.set_buffer_limit(None);
+
+        do_handshake(&mut client, &mut server);
+        (client, server)
+    }
+
+    pub fn bench_transfer(client: &mut ClientConnection, server: &mut ServerConnection, buf: &[u8]) {
+        server.writer().write_all(buf).unwrap();
+        transfer(server, client, Some(buf.len()));
+    }
+
+    fn do_handshake(client: &mut ClientConnection, server: &mut ServerConnection) {
+        loop {
+            transfer(client, server, None);
+            transfer(server, client, None);
+            if !server.is_handshaking() && !client.is_handshaking() {
+                break;
+            }
+        }
     }
 
     fn transfer<L, R, LS, RS>(left: &mut L, right: &mut R, expect_data: Option<usize>)
@@ -409,6 +455,8 @@ mod candidate {
             LS: SideData,
             RS: SideData,
     {
+        // TODO: why these numbers?
+        // TODO: will this amount of stack allocation cause any noise?
         let mut tls_buf = [0u8; 262144];
         let mut data_left = expect_data;
         let mut data_buf = [0u8; 8192];
@@ -447,7 +495,7 @@ mod candidate {
                     loop {
                         let sz = match right.reader().read(&mut data_buf) {
                             Ok(sz) => sz,
-                            Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => break,
+                            Err(err) if err.kind() == io::ErrorKind::WouldBlock => break,
                             Err(err) => panic!("failed to read data: {}", err),
                         };
 
@@ -477,12 +525,12 @@ fn main() {
     let bench_scenarios = [
         BenchmarkScenario {
             baseline_params: BenchmarkParam::new(
-                shared::KeyType::Ecdsa,
+                shared::KeyType::Rsa,
                 rustls_baseline::cipher_suite::TLS13_AES_128_GCM_SHA256,
                 &rustls_baseline::version::TLS13,
             ),
             candidate_params: BenchmarkParam::new(
-                shared::KeyType::Ecdsa,
+                shared::KeyType::Rsa,
                 rustls_candidate::cipher_suite::TLS13_AES_128_GCM_SHA256,
                 &rustls_candidate::version::TLS13,
             ),
@@ -491,54 +539,86 @@ fn main() {
         },
         BenchmarkScenario {
             baseline_params: BenchmarkParam::new(
-                shared::KeyType::Ecdsa,
+                shared::KeyType::Rsa,
                 rustls_baseline::cipher_suite::TLS13_AES_128_GCM_SHA256,
                 &rustls_baseline::version::TLS13,
             ),
             candidate_params: BenchmarkParam::new(
-                shared::KeyType::Ecdsa,
+                shared::KeyType::Rsa,
+                rustls_candidate::cipher_suite::TLS13_AES_128_GCM_SHA256,
+                &rustls_candidate::version::TLS13,
+            ),
+            client_auth: shared::ClientAuth::No,
+            resumption: ResumptionParam::SessionID,
+        },
+        BenchmarkScenario {
+            baseline_params: BenchmarkParam::new(
+                shared::KeyType::Rsa,
+                rustls_baseline::cipher_suite::TLS13_AES_128_GCM_SHA256,
+                &rustls_baseline::version::TLS13,
+            ),
+            candidate_params: BenchmarkParam::new(
+                shared::KeyType::Rsa,
                 rustls_candidate::cipher_suite::TLS13_AES_128_GCM_SHA256,
                 &rustls_candidate::version::TLS13,
             ),
             client_auth: shared::ClientAuth::No,
             resumption: ResumptionParam::Tickets,
         },
-        BenchmarkScenario {
-            baseline_params: BenchmarkParam::new(
-                shared::KeyType::Ecdsa,
-                rustls_baseline::cipher_suite::TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256,
-                &rustls_baseline::version::TLS12,
-            ),
-            candidate_params: BenchmarkParam::new(
-                shared::KeyType::Ecdsa,
-                rustls_candidate::cipher_suite::TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256,
-                &rustls_candidate::version::TLS12,
-            ),
-            client_auth: shared::ClientAuth::No,
-            resumption: ResumptionParam::No,
-        },
-        BenchmarkScenario {
-            baseline_params: BenchmarkParam::new(
-                shared::KeyType::Ecdsa,
-                rustls_baseline::cipher_suite::TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256,
-                &rustls_baseline::version::TLS12,
-            ),
-            candidate_params: BenchmarkParam::new(
-                shared::KeyType::Ecdsa,
-                rustls_candidate::cipher_suite::TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256,
-                &rustls_candidate::version::TLS12,
-            ),
-            client_auth: shared::ClientAuth::No,
-            resumption: ResumptionParam::Tickets,
-        },
+        // BenchmarkScenario {
+        //     baseline_params: BenchmarkParam::new(
+        //         shared::KeyType::Rsa,
+        //         rustls_baseline::cipher_suite::TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256,
+        //         &rustls_baseline::version::TLS12,
+        //     ),
+        //     candidate_params: BenchmarkParam::new(
+        //         shared::KeyType::Rsa,
+        //         rustls_candidate::cipher_suite::TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256,
+        //         &rustls_candidate::version::TLS12,
+        //     ),
+        //     client_auth: shared::ClientAuth::No,
+        //     resumption: ResumptionParam::No,
+        // },
+        // BenchmarkScenario {
+        //     baseline_params: BenchmarkParam::new(
+        //         shared::KeyType::Ecdsa,
+        //         rustls_baseline::cipher_suite::TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256,
+        //         &rustls_baseline::version::TLS12,
+        //     ),
+        //     candidate_params: BenchmarkParam::new(
+        //         shared::KeyType::Ecdsa,
+        //         rustls_candidate::cipher_suite::TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256,
+        //         &rustls_candidate::version::TLS12,
+        //     ),
+        //     client_auth: shared::ClientAuth::No,
+        //     resumption: ResumptionParam::Tickets,
+        // },
     ];
 
-    for scenario in bench_scenarios {
-        run_benchmark(&scenario);
+    for scenario in &bench_scenarios {
+        run_handshake_benchmark(black_box(scenario));
     }
+
+    let thing = BenchmarkScenario {
+        baseline_params: BenchmarkParam::new(
+            shared::KeyType::Rsa,
+            rustls_baseline::cipher_suite::TLS13_AES_128_GCM_SHA256,
+            &rustls_baseline::version::TLS13,
+        ),
+        candidate_params: BenchmarkParam::new(
+            shared::KeyType::Rsa,
+            rustls_candidate::cipher_suite::TLS13_AES_128_GCM_SHA256,
+            &rustls_candidate::version::TLS13,
+        ),
+        client_auth: shared::ClientAuth::No,
+        resumption: ResumptionParam::No,
+    };
+
+    run_transfer_benchmark(&black_box(thing), black_box(1024 * 1024));
+    // run_transfer_benchmark(&scenario, 1024 * 1024 * 2);
 }
 
-fn run_benchmark(scenario: &BenchmarkScenario) {
+fn run_handshake_benchmark(scenario: &BenchmarkScenario) {
     let baseline_client_config = Arc::new(baseline::make_client_config(&scenario.baseline_params, scenario.client_auth, scenario.resumption));
     let baseline_server_config = Arc::new(baseline::make_server_config(&scenario.baseline_params, scenario.client_auth, scenario.resumption, None));
     let candidate_client_config = Arc::new(candidate::make_client_config(&scenario.candidate_params, scenario.client_auth, scenario.resumption));
@@ -566,6 +646,65 @@ fn run_benchmark(scenario: &BenchmarkScenario) {
         }
     }
 
+    report_results(&format!("handshake (resumption = {})", scenario.resumption.label()), scenario, &timings);
+}
+
+fn run_transfer_benchmark(scenario: &BenchmarkScenario, size: usize) {
+    let max_fragment_size = None;
+    let buf = vec![0; size];
+
+    let baseline_client_config = Arc::new(baseline::make_client_config(
+        &scenario.baseline_params,
+        ClientAuth::No,
+        ResumptionParam::No,
+    ));
+    let baseline_server_config = Arc::new(baseline::make_server_config(
+        &scenario.baseline_params,
+        ClientAuth::No,
+        ResumptionParam::No,
+        max_fragment_size,
+    ));
+    let candidate_client_config = Arc::new(candidate::make_client_config(
+        &scenario.candidate_params,
+        ClientAuth::No,
+        ResumptionParam::No,
+    ));
+    let candidate_server_config = Arc::new(candidate::make_server_config(
+        &scenario.candidate_params,
+        ClientAuth::No,
+        ResumptionParam::No,
+        max_fragment_size,
+    ));
+
+    let runs = 200;
+    let mut timings = Vec::with_capacity(200);
+
+    let mut rng = fastrand::Rng::with_seed(42);
+    for _ in 0..runs {
+        let (mut baseline_client, mut baseline_server) = baseline::handshaked_connections(baseline_client_config.clone(), baseline_server_config.clone());
+        let (mut candidate_client, mut candidate_server) = candidate::handshaked_connections(candidate_client_config.clone(), candidate_server_config.clone());
+
+        if rng.bool() {
+            let candidate_start = Instant::now();
+            candidate::bench_transfer(&mut candidate_client, &mut candidate_server, &buf);
+            let candidate_end_baseline_start = Instant::now();
+            baseline::bench_transfer(&mut baseline_client, &mut baseline_server, &buf);
+            let baseline_end = Instant::now();
+            timings.push((baseline_end - candidate_end_baseline_start, candidate_end_baseline_start - candidate_start));
+        } else {
+            let baseline_start = Instant::now();
+            baseline::bench_transfer(&mut baseline_client, &mut baseline_server, &buf);
+            let baseline_end_candidate_start = Instant::now();
+            candidate::bench_transfer(&mut candidate_client, &mut candidate_server, &buf);
+            let candidate_end = Instant::now();
+            timings.push((baseline_end_candidate_start - baseline_start, candidate_end - baseline_end_candidate_start));
+        }
+    }
+
+    report_results(&format!("transfer {} MB", size / 1024 / 1024), scenario, &timings);
+}
+
+fn report_results(name: &str, scenario: &BenchmarkScenario, timings: &[(Duration, Duration)]) {
     let mut diffs = timings.iter().map(|(baseline_duration, candidate_duration)| {
         let baseline_nanos = baseline_duration.as_nanos() as i128;
         let candidate_nanos = candidate_duration.as_nanos() as i128;
@@ -584,11 +723,11 @@ fn run_benchmark(scenario: &BenchmarkScenario) {
     let baseline_min_micros = timings.iter().map(|(d1, _)| d1).min().unwrap().as_micros();
     let candidate_min_micros = timings.iter().map(|(_, d2)| d2).min().unwrap().as_micros();
 
+    println!("Benchmark name: {name}");
     println!("Config:");
     println!("* Baseline: {:?} {:?} (key = {:?})", scenario.baseline_params.version, scenario.baseline_params.ciphersuite, scenario.baseline_params.key_type);
     println!("* Candidate: {:?} {:?} (key = {:?})", scenario.candidate_params.version, scenario.candidate_params.ciphersuite, scenario.candidate_params.key_type);
-    println!("* Resumption = {}", scenario.resumption.label());
-    println!("Results after {runs} runs:");
+    println!("Results after {} runs:", diffs.len());
     println!("* Discarded outliers: {outliers}");
     println!("* Minimum runtime (baseline): {} (µs)", baseline_min_micros);
     println!("* Minimum runtime (candidate): {} (µs)", candidate_min_micros);
@@ -609,4 +748,12 @@ fn run_benchmark(scenario: &BenchmarkScenario) {
     }
 
     println!();
+}
+
+fn black_box<T>(dummy: T) -> T {
+    unsafe {
+        let ret = std::ptr::read_volatile(&dummy);
+        std::mem::forget(dummy);
+        ret
+    }
 }

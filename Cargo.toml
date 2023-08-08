@@ -7,6 +7,6 @@ edition = "2021"
 
 [dependencies]
 fastrand = "2.0.0"
-rustls_baseline = { package = "rustls", version = "=0.21.0" }
-rustls_candidate = { package = "rustls", git = "https://github.com/rustls/rustls.git", rev="40e4b5d6428edcac2275b547edb70e028beb9f31" }
+rustls_baseline = { package = "rustls", git = "https://github.com/rustls/rustls.git", rev = "22e6a87f6d5c44212f2969d1fb31ed889499b63a" }
+rustls_candidate = { package = "rustls", git = "https://github.com/rustls/rustls.git", rev = "ae1d72f229555cbe87f7abe9784edc918750fb93", features = ["webpki"] }
 rustls-pemfile = "1.0.3"
