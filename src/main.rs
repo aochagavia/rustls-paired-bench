@@ -574,8 +574,8 @@ fn run_benchmark(scenario: &BenchmarkScenario) {
 
     diffs.sort_unstable();
 
-    let q25 = diffs[24];
-    let q75 = diffs[74];
+    let q25 = diffs[diffs.len() * 25 / 100];
+    let q75 = diffs[diffs.len() * 75 / 100];
     let iqr = q75 - q25;
     let scaled_iqr = iqr * 3 / 2; // 1.5 iqr
 
